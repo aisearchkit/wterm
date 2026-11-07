@@ -1,0 +1,131 @@
+name: bundle
+
+# 直接用上游 vercel-labs/wterm 的 main 源码编译 wterm.js / wterm.css（不压缩 + sourcemap）。
+# 本 fork 只放 bundle/ 和这个 workflow，不需要合并上游，也就不会有冲突。
+on:
+  schedule:
+    - cron: "23 1 * * *" # 每天一次，上游没变化就跳过
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: "源码仓库"
+        default: "vercel-labs/wterm"
+      source_ref:
+        description: "分支 / tag / commit"
+        default: "main"
+      build_wasm:
+        description: "用 Zig 从源码重新编译 wasm"
+        type: boolean
+        default: false
+      minify:
+        description: "压缩 JS"
+        type: boolean
+        default: false
+      force:
+        description: "即使该 commit 已构建过也重新发布"
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths: ["bundle/**", ".github/workflows/bundle.yml"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bundle
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: ${{ inputs.source_repo || 'vercel-labs/wterm' }}
+  SOURCE_REF: ${{ inputs.source_ref || 'main' }}
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout bundle scripts
+        uses: actions/checkout@v4
+
+      - name: Checkout wterm source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_REF }}
+          path: wterm-src
+
+      - name: Resolve version and tag
+        id: meta
+        run: |
+          sha=$(git -C wterm-src rev-parse HEAD)
+          ver=$(node -p "require('./wterm-src/packages/@wterm/core/package.json').version")
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "ver=$ver" >> "$GITHUB_OUTPUT"
+          echo "tag=v${ver}-${sha:0:7}" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if this commit was already built
+        id: skip
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ inputs.force }}" != "true" ] && [ "${{ inputs.minify }}" != "true" ] \
+             && [ "${{ inputs.build_wasm }}" != "true" ] \
+             && gh release view "${{ steps.meta.outputs.tag }}" >/dev/null 2>&1; then
+            echo "already built: ${{ steps.meta.outputs.tag }}"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-node@v4
+        if: steps.skip.outputs.skip != 'true'
+        with:
+          node-version: 22
+
+      - uses: mlugg/setup-zig@v2
+        if: steps.skip.outputs.skip != 'true' && inputs.build_wasm
+        with:
+          version: 0.16.0
+
+      - name: Build wasm from Zig (optional)
+        if: steps.skip.outputs.skip != 'true' && inputs.build_wasm
+        working-directory: wterm-src
+        run: |
+          zig build -Doptimize=ReleaseSmall
+          cp zig-out/bin/wterm.wasm packages/@wterm/core/wasm/wterm.wasm
+
+      - name: Build bundle
+        if: steps.skip.outputs.skip != 'true'
+        working-directory: bundle
+        env:
+          WTERM_SRC: ${{ github.workspace }}/wterm-src
+        run: |
+          npm install --no-audit --no-fund
+          node build.mjs ${{ inputs.minify && '--minify' || '' }}
+          echo "source: ${SOURCE_REPO}@${{ steps.meta.outputs.sha }}" >> dist/VERSION.txt
+
+      - name: Smoke test in headless Chromium
+        if: steps.skip.outputs.skip != 'true'
+        working-directory: bundle
+        run: |
+          npm install --no-save --no-audit --no-fund playwright
+          npx playwright install --with-deps chromium
+          node smoke.mjs
+
+      - uses: actions/upload-artifact@v4
+        if: steps.skip.outputs.skip != 'true'
+        with:
+          name: wterm-${{ steps.meta.outputs.tag }}
+          path: bundle/dist/
+
+      - name: Publish releases (versioned + rolling "latest")
+        if: steps.skip.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: bundle/dist
+        run: |
+          tag="${{ steps.meta.outputs.tag }}"
+          notes="wterm ${{ steps.meta.outputs.ver }} — ${SOURCE_REPO}@${{ steps.meta.outputs.sha }} (${SOURCE_REF})"
+          files="wterm.js wterm.js.map wterm.css WTERM-LICENSE.txt VERSION.txt"
+          gh release delete "$tag" --cleanup-tag -y 2>/dev/null || true
+          gh release create "$tag" $files --target "$GITHUB_SHA" --title "$tag" --notes "$notes"
+          gh release delete latest --cleanup-tag -y 2>/dev/null || true
+          gh release create latest $files --target "$GITHUB_SHA" --title "latest ($tag)" --notes "$notes"
