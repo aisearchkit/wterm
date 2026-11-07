@@ -3,8 +3,6 @@ name: bundle
 # 直接用上游 vercel-labs/wterm 的 main 源码编译 wterm.js / wterm.css（不压缩 + sourcemap）。
 # 本 fork 只放 bundle/ 和这个 workflow，不需要合并上游，也就不会有冲突。
 on:
-  schedule:
-    - cron: "23 1 * * *" # 每天一次，上游没变化就跳过
   workflow_dispatch:
     inputs:
       source_repo:
@@ -16,7 +14,7 @@ on:
       build_wasm:
         description: "用 Zig 从源码重新编译 wasm"
         type: boolean
-        default: false
+        default: true
       minify:
         description: "压缩 JS"
         type: boolean
